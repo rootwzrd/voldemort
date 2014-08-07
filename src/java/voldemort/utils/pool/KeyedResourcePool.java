@@ -71,6 +71,7 @@ public class KeyedResourcePool<K, V> {
     private final ResourceFactory<K, V> objectFactory;
     private final ResourcePoolConfig resourcePoolConfig;
     private final ConcurrentMap<K, Pool<V>> resourcePoolMap;
+    private final AtomicInteger connectionsInProgress = new AtomicInteger(0);
 
     public KeyedResourcePool(ResourceFactory<K, V> objectFactory,
                              ResourcePoolConfig resourcePoolConfig) {
@@ -123,6 +124,8 @@ public class KeyedResourcePool<K, V> {
         checkNotClosed();
 
         long startNs = System.nanoTime();
+        long timeoutNs = resourcePoolConfig.getTimeout(TimeUnit.NANOSECONDS);
+        long endNs = startNs + timeoutNs;
         Pool<V> resourcePool = getResourcePoolForKey(key);
         V resource = null;
         try {
@@ -172,15 +175,75 @@ public class KeyedResourcePool<K, V> {
      * resource pool.
      */
     protected V attemptNonBlockingCheckout(K key, Pool<V> pool) throws Exception {
-        V resource = pool.nonBlockingGet();
+        V resource = null;
+        // Each thread gets the connection from the existing pool. If no
+        // connection is available, it requests one and waits for it to be
+        // created. But a thread that requests the connection and before it
+        // could wait, other thread could steal that connection. The
+        // connectionsInProgress tries to avoid these edge cases by not
+        // requesting a connection from the pool when other thread is
+        // requesting one.
+        if(connectionsInProgress.get() == 0) {
+            resource = pool.nonBlockingGet();
+        }
         if(resource == null) {
-            while(pool.attemptGrow(key, this.objectFactory)) {
-                resource = pool.nonBlockingGet();
-                if(resource != null)
-                    break;
+            // This always creates 2 connections, one for current use and one
+            // for future use as an optimization. This only matters when growing
+            // the pool, after that this code has no-effect.
+            for(int attempts = 0; attempts < 2; attempts++) {
+                connectionsInProgress.incrementAndGet();
+                try {
+                    boolean isPoolGrown = attemptGrow(key, this.objectFactory, pool);
+
+                    resource = pool.nonBlockingGet();
+                    if(resource != null)
+                        break;
+
+                    if(isPoolGrown == false)
+                        break;
+                } finally {
+                    connectionsInProgress.decrementAndGet();
+                }
             }
         }
         return resource;
+    }
+
+    /**
+     * If there is room in the pool, attempt to to create a new resource and add
+     * it to the pool. This method is cheap to call even if the pool is full
+     * (i.e., the first thing it does is looks a the current size of the pool
+     * relative to the max pool size.
+     * 
+     * @param key
+     * @param objectFactory
+     * @return True if and only if a resource was successfully added to the
+     *         pool.
+     * @throws Exception if there are issues creating a new object, or
+     *         destroying newly created object that could not be added to the
+     *         pool.
+     * 
+     */
+    private boolean attemptGrow(K key, ResourceFactory<K, V> objectFactory, Pool<V> pool)
+            throws Exception {
+        if(pool.size.get() >= pool.maxPoolSize) {
+            return false;
+        }
+
+        if(pool.size.incrementAndGet() <= pool.maxPoolSize) {
+            try {
+                objectFactory.createAsync(key, this);
+            } catch(Exception e) {
+                // If nonBlockingPut throws an exception, then we could leak
+                // the resource created by objectFactory.create().
+                pool.size.decrementAndGet();
+                throw e;
+            }
+        } else {
+            pool.size.decrementAndGet();
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -231,13 +294,18 @@ public class KeyedResourcePool<K, V> {
         }
     }
 
+    public void reportException(K key, Exception e) {
+        Pool<V> resourcePool = resourcePoolMap.get(key);
+        resourcePool.reportException(e);
+    }
+
     /**
      * Check the given resource back into the pool
      * 
      * @param key The key for the resource
      * @param resource The resource
      */
-    public void checkin(K key, V resource) throws Exception {
+    public void checkin(K key, V resource) {
         if(isOpenAndValid(key, resource)) {
             Pool<V> resourcePool = getResourcePoolForExistingKey(key);
             boolean success = resourcePool.nonBlockingPut(resource);
@@ -248,7 +316,7 @@ public class KeyedResourcePool<K, V> {
         }
     }
 
-    protected boolean isOpenAndValid(K key, V resource) throws Exception {
+    protected boolean isOpenAndValid(K key, V resource) {
         if(isOpen.get() && objectFactory.validate(key, resource)) {
             return true;
         } else {
@@ -265,7 +333,8 @@ public class KeyedResourcePool<K, V> {
             for(Entry<K, Pool<V>> entry: resourcePoolMap.entrySet()) {
                 Pool<V> pool = entry.getValue();
                 // destroy each resource in the queue
-                for(V value = pool.nonBlockingGet(); value != null; value = pool.nonBlockingGet())
+                List<V> values = pool.close();
+                for(V value: values)
                     destroyResource(entry.getKey(), entry.getValue(), value);
                 resourcePoolMap.remove(entry.getKey());
             }
@@ -424,78 +493,42 @@ public class KeyedResourcePool<K, V> {
         final private AtomicInteger blockingGets = new AtomicInteger(0);
         final private int maxPoolSize;
         final private BlockingQueue<V> queue;
+        private final BlockingQueue<Exception> asyncExceptions;
 
         public Pool(ResourcePoolConfig resourcePoolConfig) {
             this.maxPoolSize = resourcePoolConfig.getMaxPoolSize();
             queue = new ArrayBlockingQueue<V>(this.maxPoolSize, resourcePoolConfig.isFair());
+            final int EXCEPTION_COUNT_MAX = 300;
+            this.asyncExceptions = new ArrayBlockingQueue<Exception>(EXCEPTION_COUNT_MAX);
         }
 
-        /**
-         * If there is room in the pool, attempt to to create a new resource and
-         * add it to the pool. This method is cheap to call even if the pool is
-         * full (i.e., the first thing it does is looks a the current size of
-         * the pool relative to the max pool size.
-         * 
-         * @param key
-         * @param objectFactory
-         * @return True if and only if a resource was successfully added to the
-         *         pool.
-         * @throws Exception if there are issues creating a new object, or
-         *         destroying newly created object that could not be added to
-         *         the pool.
-         * 
-         */
-        public <K> boolean attemptGrow(K key, ResourceFactory<K, V> objectFactory) throws Exception {
-            if(this.size.get() >= this.maxPoolSize) {
-                return false;
-            }
-
-            if(this.size.incrementAndGet() <= this.maxPoolSize) {
-                try {
-                    V resource = objectFactory.create(key);
-                    if(resource != null) {
-                        if(!nonBlockingPut(resource)) {
-                            this.size.decrementAndGet();
-                            objectFactory.destroy(key, resource);
-                            if(logger.isInfoEnabled()) {
-                                logger.info("attemptGrow established new connection for key "
-                                            + key.toString()
-                                            + " and immediately destroyed the new connection "
-                                            + "because there were too many connections already established.");
-                            }
-                            return false;
-                        }
-                        if(logger.isDebugEnabled()) {
-                            logger.debug("attemptGrow established new connection for key "
-                                         + key.toString() + ". "
-                                         + " After checking in to KeyedResourcePool, there are "
-                                         + queue.size() + " destinations checked in.");
-                        }
-                    }
-                } catch(Exception e) {
-                    // If nonBlockingPut throws an exception, then we could leak
-                    // the resource created by objectFactory.create().
-                    this.size.decrementAndGet();
-                    throw e;
-                }
-            } else {
-                this.size.decrementAndGet();
-                return false;
-            }
-            return true;
+        public void reportException(Exception e) {
+            asyncExceptions.offer(e);
         }
 
-        public V nonBlockingGet() {
+        private void throwReportedExceptions() throws Exception {
+            Exception e = asyncExceptions.poll();
+            if(e != null)
+                throw e;
+        }
+
+        public V nonBlockingGet() throws Exception {
+            throwReportedExceptions();
             return this.queue.poll();
         }
 
-        public V blockingGet(long timeoutNs) throws InterruptedException {
+        public V blockingGet(long timeoutNs) throws Exception {
+            throwReportedExceptions();
             V v;
             try {
                 blockingGets.incrementAndGet();
                 v = this.queue.poll(timeoutNs, TimeUnit.NANOSECONDS);
             } finally {
                 blockingGets.decrementAndGet();
+            }
+
+            if(v == null) {
+                throwReportedExceptions();
             }
             return v;
         }
@@ -505,6 +538,7 @@ public class KeyedResourcePool<K, V> {
         }
 
         public List<V> close() {
+            asyncExceptions.clear();
             List<V> list = new ArrayList<V>();
             queue.drainTo(list);
             return list;

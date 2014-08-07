@@ -61,6 +61,10 @@ public abstract class AbstractClientRequest<T> implements ClientRequest<T> {
         return true;
     }
 
+    public void reportException(IOException e) {
+        error = e;
+    }
+
     public void parseResponse(DataInputStream inputStream) {
         try {
             result = parseResponseInternal(inputStream);
@@ -73,7 +77,15 @@ public abstract class AbstractClientRequest<T> implements ClientRequest<T> {
         }
     }
 
-    public T getResult() throws VoldemortException, IOException {
+    public T getResult() throws UnreachableStoreException, UnreachableStoreException {
+
+        if(error != null) {
+            if(error instanceof IOException)
+                throw new UnreachableStoreException("Error while executing client operation", error);
+            else if(error instanceof VoldemortException)
+                throw (VoldemortException) error;
+        }
+
         if(isTimedOut)
             throw new StoreTimeoutException("Request timed out");
 
@@ -82,11 +94,6 @@ public abstract class AbstractClientRequest<T> implements ClientRequest<T> {
 
         if(!isParsed)
             throw new UnreachableStoreException("Client response not read/parsed, cannot determine result");
-
-        if(error instanceof IOException)
-            throw (IOException) error;
-        else if(error instanceof VoldemortException)
-            throw (VoldemortException) error;
 
         return result;
     }
