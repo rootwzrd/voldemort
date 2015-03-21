@@ -220,6 +220,12 @@ public class QueuedKeyedResourcePool<K, V> extends KeyedResourcePool<K, V> {
     private void processQueueLoop(K key) {
         while(processQueue(key)) {}
     }
+    
+    @Override
+    public void reportException(K key, Exception e) {
+        super.reportException(key, e);
+        processQueueLoop(key);
+    }
 
     /**
      * Check the given resource back into the pool

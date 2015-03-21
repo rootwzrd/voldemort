@@ -47,6 +47,7 @@ public abstract class AbstractClientRequest<T> implements ClientRequest<T> {
 
     protected abstract T parseResponseInternal(DataInputStream inputStream) throws IOException;
 
+    @Override
     public boolean formatRequest(DataOutputStream outputStream) {
         try {
             formatRequestInternal(outputStream);
@@ -61,10 +62,12 @@ public abstract class AbstractClientRequest<T> implements ClientRequest<T> {
         return true;
     }
 
+    @Override
     public void reportException(IOException e) {
         error = e;
     }
 
+    @Override
     public void parseResponse(DataInputStream inputStream) {
         try {
             result = parseResponseInternal(inputStream);
@@ -77,7 +80,8 @@ public abstract class AbstractClientRequest<T> implements ClientRequest<T> {
         }
     }
 
-    public T getResult() throws UnreachableStoreException, UnreachableStoreException {
+    @Override
+    public T getResult() throws UnreachableStoreException {
 
         if(error != null) {
             if(error instanceof IOException)
@@ -98,18 +102,22 @@ public abstract class AbstractClientRequest<T> implements ClientRequest<T> {
         return result;
     }
 
+    @Override
     public final void complete() {
         isComplete = true;
     }
 
+    @Override
     public boolean isComplete() {
         return isComplete;
     }
 
+    @Override
     public final void timeOut() {
         isTimedOut = true;
     }
 
+    @Override
     public boolean isTimedOut() {
         return isTimedOut;
     }

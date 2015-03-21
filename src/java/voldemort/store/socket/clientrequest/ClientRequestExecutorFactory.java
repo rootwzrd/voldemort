@@ -127,8 +127,8 @@ public class ClientRequestExecutorFactory implements
      * @param dest {@link SocketDestination}
      */
     @Override
-    public void createAsync(SocketDestination dest,
-                            KeyedResourcePool<SocketDestination, ClientRequestExecutor> pool)
+    public void createAsync(final SocketDestination dest,
+                            final KeyedResourcePool<SocketDestination, ClientRequestExecutor> pool)
             throws Exception {
         int numCreated = created.incrementAndGet();
         if(logger.isDebugEnabled())
@@ -168,16 +168,13 @@ public class ClientRequestExecutorFactory implements
 
             ProtocolNegotiatorClientRequest protocolRequest = new ProtocolNegotiatorClientRequest(dest.getRequestFormatType());
 
-            final KeyedResourcePool<SocketDestination, ClientRequestExecutor> poolCopy = pool;
-            final SocketDestination destCopy = dest;
-
             NonblockingStoreCallback callback = new NonblockingStoreCallback() {
 
                 @Override
                 public void requestComplete(Object result, long requestTime) {
                     if(result instanceof Exception) {
-                        logger.warn("Reporting exception to pool " + result.getClass());
-                        poolCopy.reportException(destCopy, (Exception) result);
+                        logger.info("Reporting exception to pool " + result.getClass());
+                        pool.reportException(dest, (Exception) result);
                     }
                 }
 

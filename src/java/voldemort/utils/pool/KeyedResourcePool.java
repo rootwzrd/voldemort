@@ -30,6 +30,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.log4j.Logger;
 
+import voldemort.utils.Pair;
+import voldemort.utils.Time;
 import voldemort.utils.Utils;
 
 /**
@@ -130,29 +132,45 @@ public class KeyedResourcePool<K, V> {
         V resource = null;
         try {
             checkNotClosed();
-            // Must attempt a non blocking checkout before blockingGet to ensure
-            // resources are created for the pool.
-            resource = attemptNonBlockingCheckout(key, resourcePool);
+            long totalNonBlockingElapsedNs = 0;
+            long iterStartTime = 0;
+            long totalBlockingElapsedNs = 0;
+            final long MAX_WAIT_TIME = 300 * Time.NS_PER_MS;
+
+            while(resource == null && (iterStartTime = System.nanoTime()) < endNs) {
+                // Must attempt a non blocking checkout before blockingGet to
+                // ensure resources are created for the pool.
+                resource = attemptNonBlockingCheckout(key, resourcePool);
+
+                if(resource != null)
+                    break;
+
+                // Non blocking operation is done, compute the non blocking time
+                // it took in this iteration and add it to overall.
+                long nonBlockingFinishTime = System.nanoTime();
+                totalNonBlockingElapsedNs += (nonBlockingFinishTime - iterStartTime);
+                long timeRemainingNs = endNs - nonBlockingFinishTime;
+
+                long waitNs = timeRemainingNs;
+                // If the pool is not at the maximum size, wait and then try to
+                // grow the pool.
+                if(resourcePool.size.get() < resourcePool.maxPoolSize) {
+                    waitNs = Math.min(timeRemainingNs, MAX_WAIT_TIME);
+                }
+
+                if(waitNs > 0) {
+                    resource = resourcePool.blockingGet(waitNs);
+                    totalBlockingElapsedNs += (System.nanoTime() - nonBlockingFinishTime);
+                }
+            }
 
             if(resource == null) {
-                long nonBlockingElapsedNs = System.nanoTime() - startNs;
-                long timeRemainingNs = resourcePoolConfig.getTimeout(TimeUnit.NANOSECONDS)
-                                       - nonBlockingElapsedNs;
-
-                if(timeRemainingNs > 0) {
-                    resource = resourcePool.blockingGet(timeRemainingNs);
-                }
-
-                if(resource == null) {
-                    long totalElapsedNs = System.nanoTime() - startNs;
-                    long blockingElapsedNs = totalElapsedNs - nonBlockingElapsedNs;
-                    String errorMessage = String.format("Timeout while checking out resource (%s). Configured time (%d) ns NonBlocking time (%d) ns Blocking time (%d) ns ",
-                                                        key,
-                                                        resourcePoolConfig.getTimeout(TimeUnit.NANOSECONDS),
-                                                        nonBlockingElapsedNs,
-                                                        blockingElapsedNs);
-                    throw new TimeoutException(errorMessage);
-                }
+                String errorMessage = String.format("Timeout while checking out resource (%s). Configured time (%d) ns NonBlocking time (%d) ns Blocking time (%d) ns ",
+                                                    key,
+                                                    timeoutNs,
+                                                    totalNonBlockingElapsedNs,
+                                                    totalBlockingElapsedNs);
+                throw new TimeoutException(errorMessage);
             }
 
             if(!objectFactory.validate(key, resource))
@@ -187,23 +205,13 @@ public class KeyedResourcePool<K, V> {
             resource = pool.nonBlockingGet();
         }
         if(resource == null) {
-            // This always creates 2 connections, one for current use and one
-            // for future use as an optimization. This only matters when growing
-            // the pool, after that this code has no-effect.
-            for(int attempts = 0; attempts < 2; attempts++) {
-                connectionsInProgress.incrementAndGet();
-                try {
-                    boolean isPoolGrown = attemptGrow(key, this.objectFactory, pool);
+            connectionsInProgress.incrementAndGet();
+            try {
 
-                    resource = pool.nonBlockingGet();
-                    if(resource != null)
-                        break;
-
-                    if(isPoolGrown == false)
-                        break;
-                } finally {
-                    connectionsInProgress.decrementAndGet();
-                }
+                attemptGrow(key, this.objectFactory, pool);
+                resource = pool.nonBlockingGet();
+            } finally {
+                connectionsInProgress.decrementAndGet();
             }
         }
         return resource;
@@ -493,23 +501,37 @@ public class KeyedResourcePool<K, V> {
         final private AtomicInteger blockingGets = new AtomicInteger(0);
         final private int maxPoolSize;
         final private BlockingQueue<V> queue;
-        private final BlockingQueue<Exception> asyncExceptions;
+        private final BlockingQueue<Pair<Long, Exception>> asyncExceptions;
+
+        final long EXCEPTION_REPORT_TIME_MS = TimeUnit.MILLISECONDS.convert(3, TimeUnit.SECONDS);
+        final int EXCEPTION_COUNT_MAX = 300;
 
         public Pool(ResourcePoolConfig resourcePoolConfig) {
             this.maxPoolSize = resourcePoolConfig.getMaxPoolSize();
             queue = new ArrayBlockingQueue<V>(this.maxPoolSize, resourcePoolConfig.isFair());
-            final int EXCEPTION_COUNT_MAX = 300;
-            this.asyncExceptions = new ArrayBlockingQueue<Exception>(EXCEPTION_COUNT_MAX);
+            this.asyncExceptions = new ArrayBlockingQueue<Pair<Long, Exception>>(EXCEPTION_COUNT_MAX);
         }
 
         public void reportException(Exception e) {
-            asyncExceptions.offer(e);
+            asyncExceptions.offer(new Pair<Long, Exception>(System.currentTimeMillis(), e));
         }
 
         private void throwReportedExceptions() throws Exception {
-            Exception e = asyncExceptions.poll();
-            if(e != null)
-                throw e;
+            Pair<Long, Exception> entry;
+            while(true) {
+                entry = asyncExceptions.poll();
+                if(entry == null) {
+                    return;
+                }
+                long elapsedTime = System.currentTimeMillis() - entry.getFirst();
+                if(elapsedTime <= EXCEPTION_REPORT_TIME_MS) {
+                    Exception e = entry.getSecond();
+                    logger.info(" Throwing remembered exception. time elapsed (ms) " + elapsedTime
+                                + "Exception "
+                                + e.getMessage());
+                    throw e;
+                }
+            }
         }
 
         public V nonBlockingGet() throws Exception {

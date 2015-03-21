@@ -80,6 +80,7 @@ public class SocketResourceFactory implements ResourceFactory<SocketDestination,
     /**
      * Create a socket for the given host/port
      */
+    @Override
     public void createAsync(SocketDestination dest,
                             KeyedResourcePool<SocketDestination, SocketAndStreams> pool)
             throws Exception {
